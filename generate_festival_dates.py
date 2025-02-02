@@ -99,7 +99,7 @@ if uploaded_file is not None:
                 monthly_passengers = data.groupby(['Month', 'Airl.Desig'])['Seats'].sum().unstack(fill_value=0)
 
                 # Substituir códigos de companhias
-                airline_mapping = {'AD': 'AZUL', 'G3': 'GOL', 'JJ': 'LATAM'}
+                airline_mapping = {'AD': 'AZUL', 'G3': 'GOL', 'JJ': 'LATAM', '7M': 'VOEPASS'}
                 monthly_operations.rename(columns=airline_mapping, inplace=True)
                 monthly_passengers.rename(columns=airline_mapping, inplace=True)
 
@@ -132,7 +132,7 @@ if uploaded_file is not None:
                     y='Número de Operações',
                     color='Companhia Aérea',
                     text='Número de Operações Formatado',
-                    color_discrete_map={"AZUL": "blue", "GOL": "orange", "LATAM": "red"}
+                    color_discrete_map={"AZUL": "blue", "GOL": "orange", "LATAM": "red", "VOEPASS": "#FFD700"}
                 )
                 fig_operations.update_traces(textposition='outside')
                 fig_operations.update_layout(
@@ -152,7 +152,7 @@ if uploaded_file is not None:
                     y='Número de Passageiros',
                     color='Companhia Aérea',
                     text='Número de Passageiros Formatado',
-                    color_discrete_map={"AZUL": "blue", "GOL": "orange", "LATAM": "red"}
+                    color_discrete_map={"AZUL": "blue", "GOL": "orange", "LATAM": "red", "VOEPASS": "#FFD700"}
                 )
                 fig_passengers.update_traces(textposition='outside')
                 fig_passengers.update_layout(
@@ -264,14 +264,6 @@ if uploaded_file is not None:
 
                 data['Hour'] = data['Time'].apply(process_time_column)
 
-                # Mapear códigos da coluna 'Airl.Desig' para os nomes das companhias aéreas
-                airline_mapping = {
-                    'AD': 'AZUL',
-                    'G3': 'GOL',
-                    'JJ': 'LATAM'
-                }
-                data['Airline'] = data['Airl.Desig'].map(airline_mapping)  # Nova coluna com nomes das companhias
-
                 # Filtro para tipos de operações (Pousos, Decolagens, Todos)
                 operation_filter = st.radio(
                     "Selecione o tipo de operação:",
@@ -285,16 +277,6 @@ if uploaded_file is not None:
                     filtered_data = data[data['ArrDep'] == 'D']
                 else:
                     filtered_data = data
-
-                # Filtro adicional para companhias aéreas
-                airlines = data['Airline'].dropna().unique()  # Obtém todas as companhias disponíveis
-                selected_airline = st.selectbox(
-                    "Selecione a companhia aérea:",
-                    options=["Todas"] + list(airlines)
-                )
-
-                if selected_airline != "Todas":
-                    filtered_data = filtered_data[filtered_data['Airline'] == selected_airline]
 
                 # Contar operações por intervalo de horas
                 operations_by_hour = filtered_data.groupby('Hour').size().reset_index(name='Count')
@@ -342,55 +324,65 @@ if uploaded_file is not None:
                 stats_passengers = monthly_passengers.sum()
 
                 st.markdown(""" 
-                <div class="stats-container">
-                    <div class="stat">
-                        <div class="stat-title">Total de Operações AZUL</div>
-                        <div>{}</div>
-                    </div>
-                    <div class="stat">
-                        <div class="stat-title">Total de Operações GOL</div>
-                        <div>{}</div>
-                    </div>
-                    <div class="stat">
-                        <div class="stat-title">Total de Operações LATAM</div>
-                        <div>{}</div>
-                    </div>
-                </div>
-                <div class="stats-container">
-                    <div class="stat">
-                        <div class="stat-title">Total de Assentos AZUL</div>
-                        <div>{}</div>
-                    </div>
-                    <div class="stat">
-                        <div class="stat-title">Total de Assentos GOL</div>
-                        <div>{}</div>
-                    </div>
-                    <div class="stat">
-                        <div class="stat-title">Total de Assentos LATAM</div>
-                        <div>{}</div>
-                    </div>
-                </div>
-                <div class="general-stats">
-                    <div>Total Geral de Operações: {}</div>
-                    <div>Total Geral de Assentos Ofertados: {}</div>
-                </div>
-                """.format(
-                    f"{stats_operations['AZUL']:,}".replace(',', '.'),
-                    f"{stats_operations['GOL']:,}".replace(',', '.'),
-                    f"{stats_operations['LATAM']:,}".replace(',', '.'),
-                    f"{stats_passengers['AZUL']:,}".replace(',', '.'),
-                    f"{stats_passengers['GOL']:,}".replace(',', '.'),
-                    f"{stats_passengers['LATAM']:,}".replace(',', '.'),
-                    f"{stats_operations.sum():,}".replace(',', '.'),
-                    f"{stats_passengers.sum():,}".replace(',', '.')
-                ), unsafe_allow_html=True)
+<div class="stats-container">
+    <div class="stat">
+        <div class="stat-title">Total de Operações AZUL</div>
+        <div>{}</div>
+    </div>
+    <div class="stat">
+        <div class="stat-title">Total de Operações GOL</div>
+        <div>{}</div>
+    </div>
+    <div class="stat">
+        <div class="stat-title">Total de Operações LATAM</div>
+        <div>{}</div>
+    </div>
+    <div class="stat">
+        <div class="stat-title">Total de Operações VOEPASS</div>
+        <div>{}</div>
+    </div>
+</div>
+<div class="stats-container">
+    <div class="stat">
+        <div class="stat-title">Total de Assentos AZUL</div>
+        <div>{}</div>
+    </div>
+    <div class="stat">
+        <div class="stat-title">Total de Assentos GOL</div>
+        <div>{}</div>
+    </div>
+    <div class="stat">
+        <div class="stat-title">Total de Assentos LATAM</div>
+        <div>{}</div>
+    </div>
+    <div class="stat">
+        <div class="stat-title">Total de Assentos VOEPASS</div>
+        <div>{}</div>
+    </div>
+</div>
+<div class="general-stats">
+    <div>Total Geral de Operações: {}</div>
+    <div>Total Geral de Assentos Ofertados: {}</div>
+</div>
+""".format(
+    f"{stats_operations.get('AZUL', 0):,}".replace(',', '.'),
+    f"{stats_operations.get('GOL', 0):,}".replace(',', '.'),
+    f"{stats_operations.get('LATAM', 0):,}".replace(',', '.'),
+    f"{stats_operations.get('VOEPASS', 0):,}".replace(',', '.'),  # Usa .get() para evitar erro
+    f"{stats_passengers.get('AZUL', 0):,}".replace(',', '.'),
+    f"{stats_passengers.get('GOL', 0):,}".replace(',', '.'),
+    f"{stats_passengers.get('LATAM', 0):,}".replace(',', '.'),
+    f"{stats_passengers.get('VOEPASS', 0):,}".replace(',', '.'),  # Usa .get() para evitar erro
+    f"{stats_operations.sum():,}".replace(',', '.'),
+    f"{stats_passengers.sum():,}".replace(',', '.')
+), unsafe_allow_html=True)
 
         except Exception as e:
             st.error(f"Erro ao processar o arquivo: {e}")
     else:
         st.warning("Por favor, carregue um arquivo Excel para realizar a análise.")
 
-# Mantém o código original intacto abaixo deste bloco
+         # Mantém o código original intacto abaixo deste bloco
 
 def find_consecutive_operations(data, operation_type):
     data_filtered = data[data['ArrDep'] == operation_type].copy()
