@@ -40,7 +40,7 @@ st.markdown("""
     <div class="header-container">
         <div>
             <div class="title">Análise RIMA - SBJU</div>
-            <div class="subtitle">Operações simultâneas em intervalo de 45 minutos exclusivo para</div>
+            <div class="subtitle">Operações simultâneas em intervalo de 45 minutos (Exclusivo RIMA)</div>
         </div>
         <img class="logo" src="https://i.imgur.com/YetM1cb.png" alt="Logotipo">
     </div>
