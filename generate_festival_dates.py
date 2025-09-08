@@ -1,459 +1,392 @@
-import os
-import pandas as pd
-import streamlit as st
-from datetime import timedelta
-from io import BytesIO
-import plotly.express as px
+# -*- coding: utf-8 -*-
+# ================================================
+# Análise RIMA — Operações Simultâneas (janela variável)
+# Ajustes: inclui ACN (Azul Conecta, C208=9 assentos) e NÃO restringe por cia (exclui apenas "GERAL")
+# ================================================
 
-# Configuração inicial da página
-st.set_page_config(
-    page_title="Análise RIMA SBJU",
-    layout="wide"
+import hashlib
+import json
+from io import BytesIO
+from zipfile import ZipFile, ZIP_DEFLATED
+from datetime import datetime
+import os
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+st.set_page_config(page_title="Análise RIMA", layout="wide")
+title_placeholder = st.empty()
+
+st.markdown(
+    """
+    <style>
+    [data-testid="stSidebar"] { min-width: 400px; max-width: 400px; padding-top: 0rem !important; }
+    [data-testid="stSidebar"] .block-container { padding-top: 0rem !important; padding-bottom: 0rem !important; }
+    section[data-testid="stSidebar"][aria-expanded="false"] { display: none; }
+    .header-container { display: flex; justify-content: space-between; align-items: center; }
+    .title { font-size: 36px; font-weight: bold; color: #1a2732; text-align: left; }
+    .subtitle { font-size: 16px; color: #5b6b7b; text-align: left; }
+    .logo { width: 220px; max-width: 100%; height: auto; }
+    </style>
+    """,
+    unsafe_allow_html=True
 )
 
-# Cabeçalho HTML com CSS
-st.markdown("""
-    <style>
-        .header-container {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .title { 
-            font-size: 36px; 
-            font-weight: bold; 
-            color: #333333; 
-            text-align: left; 
-        }
-        .subtitle { 
-            font-size: 18px; 
-            font-style: italic; 
-            color: #666666; 
-            text-align: left; 
-        }
-        .logo {
-            width: 250px;  
-            max-width: 100%;  
-            height: auto;
-        }
-    </style>
+DEFAULT_WINDOW_MIN = 45
+DEFAULT_MIN_CONSEC = 3
+DEFAULT_MIN_COMB = 4
+THRESH_PAX_CONSEC_DEFAULT = 484
+THRESH_PAX_COMBI_DEFAULT = 580
+
+DEFAULT_COLORS = ["#0073e6", "#d62728", "#ff7f0e", "#2ca02c", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+PREFERRED_COLORS = {"AZU": "#0073e6","ACN":"#0073e6","TAM": "#d62728","GLO": "#ff7f0e","PAM": "#ffdd44"}
+
+def fmt_int(x):
+    try:
+        return f"{int(x):,}".replace(",", ".")
+    except Exception:
+        return str(x)
+
+def df_to_excel_bytes(df, sheet="Dados"):
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet)
+    return out.getvalue()
+
+def make_zip(files):
+    bio = BytesIO()
+    with ZipFile(bio, "w", compression=ZIP_DEFLATED) as zf:
+        for name, content in files:
+            zf.writestr(name, content)
+    return bio.getvalue()
+
+@st.cache_data(show_spinner=False)
+def read_excel_and_hash(file_bytes):
+    sha = hashlib.sha256(file_bytes).hexdigest()
+    df = pd.read_excel(BytesIO(file_bytes))
+    return df, sha
+
+def prepare_rima_dataframe(df_in: pd.DataFrame):
+    df = df_in.copy()
+    required = ['AERONAVE_OPERADOR','MOVIMENTO_TIPO','CALCO_DATA','CALCO_HORARIO','VOO_NUMERO','AERONAVE_TIPO','SERVICE_TYPE','PAX_LOCAL']
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError("Colunas ausentes no Excel RIMA: " + ", ".join(missing))
+
+    for col in ['AERONAVE_OPERADOR','MOVIMENTO_TIPO','VOO_NUMERO','AERONAVE_TIPO','SERVICE_TYPE']:
+        df[col] = df[col].astype(str).str.strip()
+
+    # Numéricos
+    df['PAX_LOCAL'] = pd.to_numeric(df['PAX_LOCAL'], errors='coerce').fillna(0).astype(int)
+    if 'PAX_CONEXAO_DOMESTICO' in df.columns:
+        df['PAX_CONEXAO_DOMESTICO'] = pd.to_numeric(df['PAX_CONEXAO_DOMESTICO'], errors='coerce').fillna(0).astype(int)
+    else:
+        df['PAX_CONEXAO_DOMESTICO'] = 0
+
+    # Filtros de escopo:
+    df['AERONAVE_OPERADOR'] = df['AERONAVE_OPERADOR'].str.upper().str.strip()
+    # ❌ NÃO restringe por lista de cias — ✅ remove apenas "GERAL"
+    df = df[~df['AERONAVE_OPERADOR'].isin(['GERAL','GENERAL','AVIAÇÃO GERAL','AVIACAO GERAL'])]
+    # Mantém a exclusão de SERVICE_TYPE == 'P' conforme sua lógica original
+    df = df[df['SERVICE_TYPE'].str.upper() != 'P']
+
+    df['_discard_reason'] = ""
+
+    # --- PARSE ROBUSTO DO CALCO_DATETIME ---
+    date_parsed = pd.to_datetime(df['CALCO_DATA'], errors='coerce').dt.normalize()
+    hora_raw = df['CALCO_HORARIO'].astype(str).str.extract(r'(\d{1,2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?)')[0]
+    time_parsed = pd.to_datetime(hora_raw, errors='coerce')
+
+    td = (pd.to_timedelta(time_parsed.dt.hour.fillna(0).astype(int), unit='h') +
+          pd.to_timedelta(time_parsed.dt.minute.fillna(0).astype(int), unit='m') +
+          pd.to_timedelta(time_parsed.dt.second.fillna(0).astype(int), unit='s'))
+
+    df['CALCO_DATETIME'] = date_parsed + td
+    invalid_dt = date_parsed.isna() | time_parsed.isna()
+    df.loc[invalid_dt, '_discard_reason'] += "Data/Hora inválida; "
+
+    # Assentos ofertados (inclui C208 = 9 e mantém regras A20N/A320 por cia)
+    pax_mapping = {
+        'C208': 9,  # Azul Conecta
+        '738W': 186,'A319': 140,'AT45': 47,'AT75': 70,'AT76': 70,
+        'B38M': 186,'B737': 138,'B738': 186,'E195': 118,'E295': 136,
+        'A21N': 220,'A321': 220
+    }
+    def map_seats_offered(op, typ):
+        typ = str(typ).upper().strip()
+        if typ in ['A20N','A320']:
+            return 174 if str(op).upper().strip() == 'AZU' else 176
+        return pax_mapping.get(typ, 0)
+    df['SEATS_OFFERED'] = df.apply(lambda r: map_seats_offered(r['AERONAVE_OPERADOR'], r['AERONAVE_TIPO']), axis=1)
+
+    discarded = df[df['_discard_reason'] != ""].copy()
+    discarded['_discard_reason'] = discarded['_discard_reason'].str.rstrip("; ").str.strip()
+
+    clean = df[df['_discard_reason'] == ""].copy().sort_values('CALCO_DATETIME').reset_index(drop=True)
+
+    clean['Date'] = clean['CALCO_DATETIME'].dt.date
+    clean['DateTime'] = clean['CALCO_DATETIME']
+    clean['ArrDep'] = clean['MOVIMENTO_TIPO'].str.upper().map({'P':'A','D':'D'})
+    clean['Company'] = clean['AERONAVE_OPERADOR'].astype(str).str.strip()
+    clean['Fltno'] = clean['VOO_NUMERO'].astype(str).str.strip()
+    clean['Actyp'] = clean['AERONAVE_TIPO'].astype(str).str.strip()
+
+    cols_keep = ['CALCO_DATA','CALCO_HORARIO','AERONAVE_OPERADOR','MOVIMENTO_TIPO','VOO_NUMERO','AERONAVE_TIPO','SERVICE_TYPE','PAX_LOCAL','PAX_CONEXAO_DOMESTICO','BOX','CABECEIRA','_discard_reason']
+    cols_keep = [c for c in cols_keep if c in discarded.columns]
+    return clean, discarded[cols_keep], None
+
+def consecutive_groups(df, tipo, window_min, min_size):
+    sub = df[df['ArrDep']==tipo].reset_index(drop=True)
+    res, counts, start = [], {}, 0
+    for end in range(len(sub)):
+        while (sub.loc[end,'DateTime'] - sub.loc[start,'DateTime']).total_seconds() > window_min*60:
+            start += 1
+        size = end-start+1
+        if size>=min_size:
+            counts[size] = counts.get(size,0)+1
+            block=sub.iloc[start:end+1]
+            rec={}
+            for i, (_, r) in enumerate(block.iterrows(), start=1):
+                rec[f"{i}th DateTime"]=r['DateTime'].strftime('%d/%m/%Y %H:%M')
+                rec[f"{i}th Flight"]=f"{r['AERONAVE_OPERADOR']} {r['Fltno']} - {r['Actyp']}"
+            rec['PAX (Local)']=int(block['PAX_LOCAL'].sum())
+            rec['Seats Offered']=int(block['SEATS_OFFERED'].sum())
+            res.append(rec)
+    out=pd.DataFrame(res).fillna('---')
+    if not out.empty:
+        cols=[c for c in out.columns if c not in ['PAX (Local)','Seats Offered']]
+        out=out[cols+['PAX (Local)','Seats Offered']]
+    return out, dict(sorted(counts.items(), reverse=True))
+
+def combined_groups(df, window_min, min_ops):
+    res, counts, start = [], {}, 0
+    for end in range(len(df)):
+        while (df.loc[end,'DateTime'] - df.loc[start,'DateTime']).total_seconds() > window_min*60:
+            start += 1
+        block=df.iloc[start:end+1]
+        if len(block)>=min_ops:
+            a=(block['ArrDep']=='A').sum(); d=(block['ArrDep']=='D').sum()
+            if a>0 and d>0:
+                combo=f"{int(a)} Pousos e {int(d)} Decolagens"
+                counts[combo]=counts.get(combo,0)+1
+                rec={}
+                for i,(_,r) in enumerate(block.iterrows(), start=1):
+                    sig="(A)" if r['ArrDep']=='A' else "(D)"
+                    rec[f"{i}th DateTime"]=r['DateTime'].strftime('%d/%m/%Y %H:%M')
+                    rec[f"{i}th Flight"]=f"{r['AERONAVE_OPERADOR']} {r['Fltno']} {sig} - {r['Actyp']}"
+                rec['Combination Type']=combo
+                rec['PAX (Local)']=int(block['PAX_LOCAL'].sum())
+                rec['Seats Offered']=int(block['SEATS_OFFERED'].sum())
+                res.append(rec)
+    out=pd.DataFrame(res).fillna('---')
+    if not out.empty:
+        cols=[c for c in out.columns if c not in ['Combination Type','PAX (Local)','Seats Offered']]
+        out=out[cols+['Combination Type','PAX (Local)','Seats Offered']]
+    return out, counts
+
+def days_four_plus_positions(df):
+    rows=[]
+    for date,g in df.sort_values('DateTime').groupby(df['DateTime'].dt.date):
+        current=0
+        for _,r in g.iterrows():
+            if r['ArrDep']=='A':
+                current+=1
+                if current>=4:
+                    rows.append({'Date':pd.to_datetime(date).strftime('%d/%m/%Y'),
+                                 'Time':r['DateTime'].strftime('%H:%M'),
+                                 'Last Flight':f"{r['AERONAVE_OPERADOR']} {r['Fltno']}",
+                                 'Positions':current})
+            else:
+                current-=1
+    return pd.DataFrame(rows)
+
+with st.sidebar:
+    st.header("Parâmetros")
+    window_min = st.slider("Janela (min)", 30, 120, DEFAULT_WINDOW_MIN, 5)
+    min_consec = st.number_input("Mínimo de voos (Consecutivos)", value=DEFAULT_MIN_CONSEC, min_value=2, step=1)
+    min_comb = st.number_input("Mínimo de operações (Combinados A+D)", value=DEFAULT_MIN_COMB, min_value=3, step=1)
+    THRESH_PAX_CONSEC = st.number_input("Limiar PAX Local (Consecutivos)", value=THRESH_PAX_CONSEC_DEFAULT, step=10)
+    THRESH_PAX_COMBI = st.number_input("Limiar PAX Local (Combinados)", value=THRESH_PAX_COMBI_DEFAULT, step=10)
+    only_over_threshold = st.checkbox("Mostrar apenas grupos com PAX ≥ limiar")
+    uploaded = st.file_uploader("Carregue o RIMA (xls/xlsx)", type=["xls","xlsx"])
+
+if uploaded is None:
+    title_placeholder.markdown(
+        f"""
+        <div class="header-container">
+            <div>
+                <div class="title">Análise RIMA</div>
+                <div class="subtitle">Operações simultâneas em janela de {int(window_min)} minutos • PAX Local</div>
+            </div>
+            <img class="logo" src="https://i.imgur.com/YetM1cb.png" alt="Logotipo">
+        </div>
+        <hr style="border: 1px solid #cccccc;">
+        """,
+        unsafe_allow_html=True
+    )
+    st.stop()
+
+file_bytes = uploaded.getvalue() if hasattr(uploaded,"getvalue") else uploaded.read()
+raw_df, sha = read_excel_and_hash(file_bytes)
+sha12 = sha[:12]
+
+try:
+    df, discarded_df, _ = prepare_rima_dataframe(raw_df)
+except Exception as e:
+    st.error(f"Erro ao preparar o arquivo: {e}")
+    st.stop()
+
+title_placeholder.markdown(
+    f"""
     <div class="header-container">
         <div>
-            <div class="title">Análise RIMA - SBJU</div>
-            <div class="subtitle">Operações simultâneas em intervalo de 45 minutos (Exclusivo RIMA)</div>
+            <div class="title">Análise RIMA</div>
+            <div class="subtitle">Operações simultâneas em janela de {int(window_min)} minutos • PAX Local</div>
         </div>
         <img class="logo" src="https://i.imgur.com/YetM1cb.png" alt="Logotipo">
     </div>
     <hr style="border: 1px solid #cccccc;">
-""", unsafe_allow_html=True) 
-
-import pandas as pd
-import streamlit as st
-from io import BytesIO
-
-# Estilo e título
-st.markdown("""
-    <style>
-        .title-box {
-            padding: 10px;
-            border: 1px solid #cccccc;
-            border-radius: 10px;
-            background-color: #f9f9f9;
-            font-weight: bold;
-            color: #333333;
-        }
-        .highlight-red {
-            color: red;
-            font-weight: bold;
-        }
-    </style>
-""", unsafe_allow_html=True)
-
-st.markdown(
-    "<div style='color: red; font-weight: bold;'>Escolha um arquivo Excel para análise do RIMA:</div>", 
+    """,
     unsafe_allow_html=True
 )
 
-# Uploader para arquivos Excel
-rima_file = st.file_uploader("Carregue o arquivo (formato Excel)", type=["xls", "xlsx"])
-
-def to_excel(df):
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Dados')
-    return output.getvalue()
-
-# Função para processar pousos e decolagens consecutivos
-def process_rima(data):
-    valid_companies = ['AZU', 'GLO', 'PAM', 'TAM']
-    data = data[data['AERONAVE_OPERADOR'].isin(valid_companies)].copy()
-
-    data['CALCO_DATETIME'] = pd.to_datetime(
-        data['CALCO_DATA'].astype(str) + ' ' + data['CALCO_HORARIO'].astype(str),
-        errors='coerce'
-    )
-
-    data = data.dropna(subset=['CALCO_DATETIME'])
-
-    data = data[data['SERVICE_TYPE'] != 'P']  # Excluir registros com código 'P' na coluna SERVICE_TYPE
-
-    pax_mapping = {'738W': 186, 'A319': 140, 'AT45': 47, 'AT75': 70, 'AT76': 70,
-                   'B38M': 186, 'B737': 138, 'B738': 186, 'E195': 118, 'E295': 136, 'A21N': 220, 'A321': 220}
-
-    def map_seats_offered(row):
-        if row['AERONAVE_TIPO'] in ['A20N', 'A320']:
-            return 174 if row['AERONAVE_OPERADOR'] == 'AZU' else 176
-        return pax_mapping.get(row['AERONAVE_TIPO'], 0)
-
-    data['Seats Offered'] = data.apply(map_seats_offered, axis=1)
-
-    def find_consecutive(df, operation_type):
-        df = df[df['MOVIMENTO_TIPO'] == operation_type].sort_values(by='CALCO_DATETIME').reset_index(drop=True)
-        results = []
-        group_sizes = {}
-        
-        for i in range(len(df)):
-            group = []
-            seats_offered = 0
-            occupied_seats = 0
-            
-            for j in range(i, len(df)):
-                if (df.loc[j, 'CALCO_DATETIME'] - df.loc[i, 'CALCO_DATETIME']).total_seconds() / 60 <= 45:
-                    group.append(j)
-                    seats_offered += df.loc[j, 'Seats Offered']
-                    occupied_seats += df.loc[j, 'PAX_LOCAL']
-
-            if len(group) >= 3:
-                group_size = len(group)
-                group_sizes[group_size] = group_sizes.get(group_size, 0) + 1
-                result = {
-                    '1th DateTime': df.loc[group[0], 'CALCO_DATETIME'].strftime('%d/%m/%Y %H:%M'),
-                    '1th Flight': f"{df.loc[group[0], 'AERONAVE_OPERADOR']} {int(df.loc[group[0], 'VOO_NUMERO'])} - {df.loc[group[0], 'AERONAVE_TIPO']}"
-                }
-                for idx, g in enumerate(group[1:], start=2):
-                    result[f'{idx}th DateTime'] = df.loc[g, 'CALCO_DATETIME'].strftime('%d/%m/%Y %H:%M')
-                    result[f'{idx}th Flight'] = f"{df.loc[g, 'AERONAVE_OPERADOR']} {int(df.loc[g, 'VOO_NUMERO'])} - {df.loc[g, 'AERONAVE_TIPO']}"
-                result['Occupied Seats'] = occupied_seats
-                result['Seats Offered'] = seats_offered
-                results.append(result)
-
-        results_df = pd.DataFrame(results)
-        if not results_df.empty:
-            final_columns = list(results_df.columns)
-            final_columns.remove('Occupied Seats')
-            final_columns.remove('Seats Offered')
-            final_columns.extend(['Occupied Seats', 'Seats Offered'])
-            results_df = results_df[final_columns]
-            results_df.fillna('---', inplace=True)
-        return results_df, group_sizes
-
-    def find_combined_operations(data):
-        data = data.sort_values(by='CALCO_DATETIME')
-
-        combined_operations = []
-        total_counts = {}
-
-        for i in range(len(data)):
-            group = [data.iloc[i]]
-            total_pax = data.iloc[i]['PAX_LOCAL']
-            seats_offered = data.iloc[i]['Seats Offered']
-            arrivals, departures = 0, 0
-
-            if data.iloc[i]['MOVIMENTO_TIPO'] == 'P':
-                arrivals += 1
-            else:
-                departures += 1
-
-            for j in range(i + 1, len(data)):
-                if (data.iloc[j]['CALCO_DATETIME'] - group[0]['CALCO_DATETIME']).total_seconds() / 60 <= 45:
-                    group.append(data.iloc[j])
-                    total_pax += data.iloc[j]['PAX_LOCAL']
-                    seats_offered += data.iloc[j]['Seats Offered']
-                    if data.iloc[j]['MOVIMENTO_TIPO'] == 'P':
-                        arrivals += 1
-                    else:
-                        departures += 1
-                else:
-                    break
-
-            if len(group) >= 4 and arrivals > 0 and departures > 0:
-                combination_type = f"{arrivals} Pousos e {departures} Decolagens"
-                total_counts[combination_type] = total_counts.get(combination_type, 0) + 1
-                record = {
-                    'Combination Type': combination_type,
-                    'Occupied Seats': total_pax,
-                    'Seats Offered': seats_offered
-                }
-                for idx, flight in enumerate(group):
-                    record[f'{idx+1}th DateTime'] = flight['CALCO_DATETIME'].strftime('%d/%m/%Y %H:%M')
-                    record[f'{idx+1}th Flight'] = f"{flight['AERONAVE_OPERADOR']} {int(flight['VOO_NUMERO'])} ({flight['MOVIMENTO_TIPO']}) - {flight['AERONAVE_TIPO']}"
-                combined_operations.append(record)
-
-        combined_df = pd.DataFrame(combined_operations).fillna('---')
-        if not combined_df.empty:
-            cols = [col for col in combined_df.columns if col not in ['Combination Type', 'Occupied Seats', 'Seats Offered']]
-            combined_df = combined_df[cols + ['Combination Type', 'Occupied Seats', 'Seats Offered']]
-        return combined_df, total_counts
-
-    pousos, pousos_group_sizes = find_consecutive(data, 'P')
-    decolagens, decolagens_group_sizes = find_consecutive(data, 'D')
-    combinados, combinados_group_sizes = find_combined_operations(data)
-
-    return pousos, pousos_group_sizes, decolagens, decolagens_group_sizes, combinados, combinados_group_sizes
-
-if rima_file is not None:
-    try:
-        rima_data = pd.read_excel(rima_file)
-        rima_data['PAX_LOCAL'] = rima_data['PAX_LOCAL'].fillna(0).astype(int)
-
-        pousos_result, pousos_group_sizes, decolagens_result, decolagens_group_sizes, combinados_result, combinados_group_sizes = process_rima(rima_data)
-
-        st.markdown("<div class='title'>Pousos Consecutivos (A):</div>", unsafe_allow_html=True)
-        if not pousos_result.empty:
-            for size, count in sorted(pousos_group_sizes.items()):
-                st.markdown(f"<div class='highlight-red'>Total de Operacões Consecutivas {size} Pousos: {count}</div>", unsafe_allow_html=True)
-            styled_pousos = pousos_result.style.applymap(lambda x: 'color: red;' if isinstance(x, int) and x >= 484 else '', subset=['Occupied Seats'])
-            st.dataframe(styled_pousos, use_container_width=True)
-            st.download_button("Baixar Pousos Consecutivos", to_excel(pousos_result), file_name="pousos_consecutivos.xlsx")
-        else:
-            st.write("Nenhum pouso consecutivo identificado.")
-
-        st.markdown("<div class='title'>Decolagens Consecutivas (D):</div>", unsafe_allow_html=True)
-        if not decolagens_result.empty:
-            for size, count in sorted(decolagens_group_sizes.items()):
-                st.markdown(f"<div class='highlight-red'>Total de Operacões Consecutivas {size} Decolagens: {count}</div>", unsafe_allow_html=True)
-            styled_decolagens = decolagens_result.style.applymap(lambda x: 'color: red;' if isinstance(x, int) and x >= 484 else '', subset=['Occupied Seats'])
-            st.dataframe(styled_decolagens, use_container_width=True)
-            st.download_button("Baixar Decolagens Consecutivas", to_excel(decolagens_result), file_name="decolagens_consecutivas.xlsx")
-        else:
-            st.write("Nenhuma decolagem consecutiva identificada.")
-
-        st.markdown("<div class='title'>Operações Combinadas:</div>", unsafe_allow_html=True)
-        if not combinados_result.empty:
-            for combo, count in sorted(combinados_group_sizes.items()):
-                st.markdown(f"<div class='highlight-red'>Total de {combo}: {count}</div>", unsafe_allow_html=True)
-            styled_combinados = combinados_result.style.applymap(lambda x: 'color: red;' if isinstance(x, int) and x >= 580 else '', subset=['Occupied Seats'])
-            st.dataframe(styled_combinados, use_container_width=True)
-            st.download_button("Baixar Operações Combinadas", to_excel(combinados_result), file_name="operacoes_combinadas.xlsx")
-        else:
-            st.write("Nenhuma operação combinada identificada.")
-    except Exception as e:
-        st.error(f"Erro ao processar o arquivo: {e}")
-
-import plotly.graph_objects as go
-
-if rima_file is not None:
-    try:
-        # Carregar e preparar os dados
-        if "rima_data" not in st.session_state:
-            rima_data = pd.read_excel(rima_file)
-            rima_data['PAX_LOCAL'] = pd.to_numeric(rima_data['PAX_LOCAL'], errors='coerce').fillna(0)
-            rima_data['PAX_CONEXAO_DOMESTICO'] = pd.to_numeric(rima_data['PAX_CONEXAO_DOMESTICO'], errors='coerce').fillna(0)
-            st.session_state["rima_data"] = rima_data
-
-        rima_data = st.session_state["rima_data"]
-
-        # Filtrar companhias desejadas
-        valid_companies = ['AZU', 'GLO', 'PAM', 'TAM']
-        df_filtered = rima_data[rima_data['AERONAVE_OPERADOR'].isin(valid_companies)].copy()
-
-        # Calcular total de passageiros por companhia
-        df_filtered['TOTAL_PAX'] = df_filtered['PAX_LOCAL'] + df_filtered['PAX_CONEXAO_DOMESTICO']
-        company_pax = df_filtered.groupby('AERONAVE_OPERADOR')['TOTAL_PAX'].sum().reset_index()
-
-        # Calcular o total geral
-        total_geral = company_pax['TOTAL_PAX'].sum()
-
-        # Adicionar coluna de percentual
-        company_pax['PERCENTUAL'] = (company_pax['TOTAL_PAX'] / total_geral) * 100
-
-        # Definir cores fixas para as companhias
-        color_map = {
-            'AZU': '#0073e6',  # Azul
-            'GLO': '#ff7f0e',  # Laranja
-            'TAM': '#d62728',  # Vermelho
-            'PAM': '#ffdd44'   # Amarelo
-        }
-
-        # Criar gráfico de barras
-        fig_bar = go.Figure()
-        for _, row in company_pax.iterrows():
-            total_pax_formatado = f"{row['TOTAL_PAX']:,.0f}".replace(",", ".")  # Formatar número corretamente
-            texto = f"<b>{total_pax_formatado} - {row['PERCENTUAL']:.1f}%</b>"  # Texto em negrito
-            
-            fig_bar.add_trace(go.Bar(
-                x=[row['AERONAVE_OPERADOR']],
-                y=[row['TOTAL_PAX']],
-                text=texto,
-                textposition='inside',  # Dentro da barra
-                marker_color=color_map.get(row['AERONAVE_OPERADOR'], '#333333'),
-                textfont=dict(size=14, color="white")  # Ajusta a cor do texto
-            ))
-
-        fig_bar.update_layout(
-            title="Passageiros Embarcados por Companhia",
-            xaxis_title="Companhia Aérea",
-            yaxis_title="Total de Passageiros",
-            template="plotly_white",
-            showlegend=False,
-            xaxis=dict(showgrid=False),  # Remove grade do eixo X
-            yaxis=dict(showgrid=False)   # Remove grade do eixo Y
-        )
-
-        # Exibir gráfico
-        st.plotly_chart(fig_bar, use_container_width=True)
-
-        # Exibir total geral centralizado e em preto
-        total_geral_formatado = f"{total_geral:,.0f}".replace(",", ".")  # Ajusta o formato numérico
-        st.markdown(
-            f"<h2 style='text-align: center; color: black;'><b>Total Geral de Passageiros: {total_geral_formatado}</b></h2>",
-            unsafe_allow_html=True
-        )
-
-    except Exception as e:
-        st.error(f"Erro ao analisar passageiros embarcados: {e}")
-
-import plotly.graph_objects as go
-import streamlit as st
-
-# Verificar se o arquivo já foi carregado
-if rima_file is not None:
-    try:
-        # Recuperar os dados carregados anteriormente
-        df_filtered = rima_data.copy()  # Agora considera todas as companhias aéreas
-
-        # 📌 Criar seleção de companhia aérea com botões de opção (radio)
-        companhia_selecionada = st.radio(
-            "Selecione a Companhia Aérea",
-            ["Todos"] + list(df_filtered["AERONAVE_OPERADOR"].unique()),
-            horizontal=True  # Deixa os botões lado a lado
-        )
-
-        # 📌 Filtrar os dados conforme a seleção
-        if companhia_selecionada == "Todos":
-            df_box_filtered = df_filtered
-        else:
-            df_box_filtered = df_filtered[df_filtered["AERONAVE_OPERADOR"] == companhia_selecionada]
-
-        # 📌 Contar quantas vezes cada BOX foi utilizado (independentemente de passageiros)
-        df_box_summary = df_box_filtered.groupby("BOX").size().reset_index(name="TOTAL_UTILIZACOES")
-
-        # 📌 Calcular percentual dentro do total
-        total_box_geral = df_box_summary["TOTAL_UTILIZACOES"].sum()
-        df_box_summary["PERCENTUAL"] = (df_box_summary["TOTAL_UTILIZACOES"] / total_box_geral) * 100
-
-        # 📌 Criar gráfico de barras para utilização de posição (BOX)
-        fig_box = go.Figure()
-        for _, row in df_box_summary.iterrows():
-            total_utilizacoes_formatado = f"{row['TOTAL_UTILIZACOES']:,.0f}".replace(",", ".")
-            texto = f"<b>{total_utilizacoes_formatado} ({row['PERCENTUAL']:.1f}%)</b>"
-
-            fig_box.add_trace(go.Bar(
-                x=[row["BOX"]],
-                y=[row["TOTAL_UTILIZACOES"]],
-                text=texto,
-                textposition="inside",
-                marker_color="#17becf",  # Azul-claro para posição (BOX)
-                textfont=dict(size=14, color="white")
-            ))
-
-        fig_box.update_layout(
-            title=f"Utilização de Posição (BOX) - {companhia_selecionada}",
-            xaxis_title="BOX",
-            yaxis_title="Total de Utilizações",
-            template="plotly_white",
-            showlegend=False,
-            xaxis=dict(showgrid=False),
-            yaxis=dict(showgrid=False)
-        )
-
-        # 📌 Exibir gráfico
-        st.plotly_chart(fig_box, use_container_width=True)
-
-    except Exception as e:
-        st.error(f"Erro ao processar o gráfico de utilização de posição: {e}")
-
-import plotly.express as px
-import streamlit as st
-
-# 📌 Garantir que os dados estejam carregados no estado da sessão
-if "rima_data" not in st.session_state:
-    st.stop()
-
-# 📌 Recuperar os dados carregados
-rima_data = st.session_state["rima_data"]
-
-# 📌 Criar o dataframe filtrado e armazená-lo no session_state se ainda não estiver salvo
-if "df_filtered" not in st.session_state:
-    df_filtered = rima_data.copy()  # Considera todas as companhias aéreas
-    st.session_state["df_filtered"] = df_filtered
-else:
-    df_filtered = st.session_state["df_filtered"]
-
-# 📌 Criar layout com colunas para organizar os filtros lado a lado
-col1, col2 = st.columns([1, 2])
-
-with col1:
-    movimento_tipo = st.radio(
-        "Selecione o Tipo de Movimento",
-        ["TODOS", "POUSO", "DECOLAGEM"],
-        horizontal=True
-    )
-
-with col2:
-    companhia_selecionada_cab = st.radio(
-        "Selecione a Companhia Aérea para o gráfico de cabeceira",
-        ["Todos"] + list(df_filtered["AERONAVE_OPERADOR"].unique()),
-        horizontal=True
-    )
-
-# 📌 Filtrar os dados conforme a seleção de companhia aérea
-if companhia_selecionada_cab == "Todos":
-    df_cab_filtered = df_filtered
-else:
-    df_cab_filtered = df_filtered[df_filtered["AERONAVE_OPERADOR"] == companhia_selecionada_cab]
-
-# 📌 Filtrar os dados conforme a seleção de tipo de movimento
-if movimento_tipo == "POUSO":
-    df_cab_filtered = df_cab_filtered[df_cab_filtered["MOVIMENTO_TIPO"] == "P"]
-elif movimento_tipo == "DECOLAGEM":
-    df_cab_filtered = df_cab_filtered[df_cab_filtered["MOVIMENTO_TIPO"] == "D"]
-
-# 📌 Verificar se há dados para exibir
-if not df_cab_filtered.empty:
-    # 📌 Contar total de operações por CABECEIRA
-    df_cab_summary = df_cab_filtered.groupby("CABECEIRA").size().reset_index(name="TOTAL_OPERACOES")
-
-    # 📌 Calcular total geral para exibir na legenda
-    total_operacoes_geral = df_cab_summary["TOTAL_OPERACOES"].sum()
-
-    # 📌 Criar rótulo personalizado com **TOTAL + PERCENTUAL**
-    df_cab_summary["LABEL"] = df_cab_summary.apply(
-        lambda row: f"<b>{row['TOTAL_OPERACOES']} ({(row['TOTAL_OPERACOES'] / total_operacoes_geral) * 100:.1f}%)</b>", axis=1
-    )
-
-    # 📌 Definir um mapa de cores suaves para cada cabeceira
-    cores_suaves = px.colors.qualitative.Pastel  # Paleta de cores suaves
-    num_cabeceiras = len(df_cab_summary["CABECEIRA"].unique())
-    cor_map = {df_cab_summary["CABECEIRA"].iloc[i]: cores_suaves[i % len(cores_suaves)] for i in range(num_cabeceiras)}
-
-    # 📌 Criar gráfico de pizza com cores suaves e layout refinado
-    fig_pizza = px.pie(
-        df_cab_summary,
-        names="CABECEIRA",
-        values="TOTAL_OPERACOES",
-        title=f"Distribuição de Operações por Cabaceira - {companhia_selecionada_cab} ({movimento_tipo})",
-        hole=0.4,  # Criando um efeito de "rosca" para melhor visualização
-        color="CABECEIRA",
-        color_discrete_map=cor_map  # Aplicar cores suaves
-    )
-
-    fig_pizza.update_traces(
-        text=df_cab_summary["LABEL"],  # Aplica o rótulo formatado (Total + Percentual)
-        textinfo="label+percent",  # Exibe tanto o rótulo quanto o percentual
-        hoverinfo="label+percent",  # Mantém percentual no hover
-        textfont=dict(size=14, color="black")  # Ajusta a cor e tamanho do texto
-    )
-
-    # 📌 Exibir gráfico atualizado
-    st.plotly_chart(fig_pizza, use_container_width=True)
+with st.expander("Saúde do dado • integridade e qualidade", expanded=True):
+    st.write(f"**Hash do arquivo (SHA-256):** `{sha12}`")
+    c1,c2,c3 = st.columns(3)
+    c1.metric("Linhas totais", fmt_int(len(raw_df)))
+    c2.metric("Linhas válidas", fmt_int(len(df)))
+    c3.metric("Descartadas", fmt_int(len(discarded_df)))
+    if len(discarded_df)>0:
+        st.markdown("**Registros descartados (com motivo):**")
+        st.dataframe(discarded_df.rename(columns={'_discard_reason':'Motivo'}), use_container_width=True, hide_index=True)
+        st.download_button("Baixar descartados (XLSX)", data=df_to_excel_bytes(discarded_df.rename(columns={'_discard_reason':'Motivo'})), file_name="descartados.xlsx")
+
+companies = sorted(df['Company'].unique().tolist())
+if 'color_map' not in st.session_state:
+    auto = {}
+    i=0
+    for label in companies:
+        auto[label] = PREFERRED_COLORS.get(label, DEFAULT_COLORS[i % len(DEFAULT_COLORS)])
+        i+=1
+    st.session_state.color_map = auto
+color_map = st.session_state.color_map
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Pousos Consecutivos (A)","Decolagens Consecutivas (D)","Operações Combinadas (A+D)","4+ Posições","Gráficos & KPIs"])
+
+with tab1:
+    A_df, A_cnt = consecutive_groups(df,'A', window_min, int(min_consec))
+    if only_over_threshold and not A_df.empty:
+        A_df = A_df[A_df['PAX (Local)']>=THRESH_PAX_CONSEC]
+    if A_df.empty:
+        st.info("Sem ocorrências de pousos consecutivos.")
+    else:
+        for k,v in A_cnt.items():
+            st.markdown(f"**Total de {k:02d} pousos consecutivos:** {fmt_int(v)}")
+        view = A_df.reset_index(drop=True)
+        st.dataframe(view.style.applymap(lambda v: 'color: red; font-weight: bold;' if isinstance(v,int) and v>=THRESH_PAX_CONSEC else '', subset=['PAX (Local)']), use_container_width=True, hide_index=True)
+        st.download_button("Baixar XLSX", data=df_to_excel_bytes(view), file_name="Pousos_Consecutivos.xlsx")
+
+with tab2:
+    D_df, D_cnt = consecutive_groups(df,'D', window_min, int(min_consec))
+    if only_over_threshold and not D_df.empty:
+        D_df = D_df[D_df['PAX (Local)']>=THRESH_PAX_CONSEC]
+    if D_df.empty:
+        st.info("Sem ocorrências de decolagens consecutivas.")
+    else:
+        for k,v in D_cnt.items():
+            st.markdown(f"**Total de {k:02d} decolagens consecutivas:** {fmt_int(v)}")
+        view = D_df.reset_index(drop=True)
+        st.dataframe(view.style.applymap(lambda v: 'color: red; font-weight: bold;' if isinstance(v,int) and v>=THRESH_PAX_CONSEC else '', subset=['PAX (Local)']), use_container_width=True, hide_index=True)
+        st.download_button("Baixar XLSX", data=df_to_excel_bytes(view), file_name="Decolagens_Consecutivas.xlsx")
+
+with tab3:
+    C_df, C_cnt = combined_groups(df, window_min, int(min_comb))
+    if only_over_threshold and not C_df.empty:
+        C_df = C_df[C_df['PAX (Local)']>=THRESH_PAX_COMBI]
+    if C_df.empty:
+        st.info("Sem ocorrências de operações combinadas.")
+    else:
+        for combo,total in C_cnt.items():
+            st.markdown(f"**Total de {combo}:** {fmt_int(total)}")
+        view = C_df.reset_index(drop=True)
+        st.dataframe(view.style.applymap(lambda v: 'color: red; font-weight: bold;' if isinstance(v,int) and v>=THRESH_PAX_COMBI else '', subset=['PAX (Local)']), use_container_width=True, hide_index=True)
+        st.download_button("Baixar XLSX", data=df_to_excel_bytes(view), file_name="Operacoes_Combinadas.xlsx")
+
+with tab4:
+    pos_df = days_four_plus_positions(df)
+    if pos_df.empty:
+        st.info("Nenhuma data com 4+ posições ocupadas.")
+    else:
+        counts = pos_df['Positions'].value_counts().sort_index()
+        for k, v in counts.items():
+            st.markdown(f"**Total de {k:02d} posições ocupadas:** {fmt_int(v)}")
+        view = pos_df.reset_index(drop=True)
+        st.dataframe(view.style.applymap(lambda v: 'color: red; font-weight: bold;', subset=['Positions']), use_container_width=True, hide_index=True)
+        st.download_button("Baixar XLSX", data=df_to_excel_bytes(view), file_name="Dias_Com_4_Posicoes.xlsx")
+
+with tab5:
+    st.subheader("KPIs Gerais (PAX Local)")
+    colf1, colf2 = st.columns([1,2])
+    with colf1:
+        tipo = st.radio("Tipo de movimento", ["Todos", "Pousos (P)", "Decolagens (D)"], horizontal=True)
+    with colf2:
+        sel_comp = st.multiselect("Companhias", options=companies, default=companies)
+    df_kpi = df.copy()
+    if tipo=="Pousos (P)":
+        df_kpi = df_kpi[df_kpi['ArrDep']=='A']
+    elif tipo=="Decolagens (D)":
+        df_kpi = df_kpi[df_kpi['ArrDep']=='D']
+    df_kpi = df_kpi[df_kpi['Company'].isin(sel_comp)]
+    c1,c2,c3 = st.columns(3)
+    c1.metric("Total de operações", fmt_int(len(df_kpi)))
+    c2.metric("PAX Local (somatório)", fmt_int(df_kpi['PAX_LOCAL'].sum()))
+    c3.metric("Companhias ativas", fmt_int(df_kpi['Company'].nunique()))
+    st.markdown("---")
+    st.subheader("Operações Mensais por Companhia")
+    df_kpi['Month'] = df_kpi['DateTime'].dt.to_period('M').astype(str)
+    ops_month = df_kpi.groupby(['Month','Company'])['ArrDep'].count().reset_index(name='Operacoes')
+    fig_ops = px.bar(ops_month, x='Month', y='Operacoes', color='Company', text=ops_month['Operacoes'].map(fmt_int), color_discrete_map=color_map, barmode='group')
+    fig_ops.update_traces(textposition='outside')
+    fig_ops.update_layout(xaxis_title="Mês", yaxis_title="Operações", showlegend=True)
+    st.plotly_chart(fig_ops, use_container_width=True)
+
+    st.subheader("PAX Local por Companhia (Mensal)")
+    pax_month = df_kpi.groupby(['Month','Company'])['PAX_LOCAL'].sum().reset_index(name='PAX')
+    fig_pax = px.bar(pax_month, x='Month', y='PAX', color='Company', text=pax_month['PAX'].map(fmt_int), color_discrete_map=color_map, barmode='group')
+    fig_pax.update_traces(textposition='outside')
+    fig_pax.update_layout(xaxis_title="Mês", yaxis_title="PAX Local", showlegend=True)
+    st.plotly_chart(fig_pax, use_container_width=True)
+
+    st.subheader("Total de Operações por Companhia (Período Filtrado)")
+    total_ops_cia = df_kpi.groupby('Company')['ArrDep'].count().reset_index(name='Operacoes').sort_values('Operacoes', ascending=False)
+    fig_total = px.bar(total_ops_cia, x='Company', y='Operacoes', text=total_ops_cia['Operacoes'].map(fmt_int), color='Company', color_discrete_map=color_map)
+    fig_total.update_traces(textposition='outside', showlegend=False)
+    fig_total.update_layout(xaxis_title="Companhia", yaxis_title="Operações")
+    st.plotly_chart(fig_total, use_container_width=True)
+
+    st.subheader("Passageiros Embarcados por Companhia (Local + Conexão Doméstica)")
+    use_conn = st.checkbox("Incluir PAX de conexão doméstica", value=True)
+    pax_col = 'PAX_TOTAL_calc'
+    df_kpi[pax_col] = df_kpi['PAX_LOCAL'] + (df_kpi['PAX_CONEXAO_DOMESTICO'] if use_conn else 0)
+    company_pax = df_kpi.groupby('Company')[pax_col].sum().reset_index().rename(columns={pax_col:'TOTAL_PAX'})
+    fig_bar = go.Figure()
+    for _, row in company_pax.iterrows():
+        txt = f"<b>{fmt_int(int(row['TOTAL_PAX']))}</b>"
+        fig_bar.add_trace(go.Bar(x=[row['Company']], y=[row['TOTAL_PAX']], text=txt, textposition='inside', marker_color=color_map.get(row['Company'],'#333333'), textfont=dict(size=14, color="white")))
+    fig_bar.update_layout(title="Passageiros Embarcados por Companhia", xaxis_title="Companhia Aérea", yaxis_title="Total de Passageiros", template="plotly_white", showlegend=False, xaxis=dict(showgrid=False), yaxis=dict(showgrid=False))
+    st.plotly_chart(fig_bar, use_container_width=True)
+    total_geral = int(company_pax['TOTAL_PAX'].sum())
+    st.markdown(f"<h3 style='text-align:center;'><b>Total Geral de Passageiros: {fmt_int(total_geral)}</b></h3>", unsafe_allow_html=True)
+
+st.subheader("Exportar pacote de auditoria")
+meta = {"hash_sha256": sha, "hash_prefix": sha12, "window_min": int(window_min), "min_consecutivos": int(min_consec), "min_combinados": int(min_comb), "threshold_pax_consecutivos": int(THRESH_PAX_CONSEC), "threshold_pax_combinados": int(THRESH_PAX_COMBI), "generated_at_utc": datetime.utcnow().isoformat()+"Z", "rows_original": int(len(raw_df)), "rows_clean": int(len(df)), "rows_discarded": int(len(discarded_df)), "airport": "RIMA", "metric_note": "PAX (Local) = embarque local conforme RIMA"}
+files = [("metadata.json", json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"))]
+if 'A_df' in locals() and isinstance(A_df, pd.DataFrame) and not A_df.empty: files.append(("pousos_consecutivos.xlsx", df_to_excel_bytes(A_df.reset_index(drop=True))))
+if 'D_df' in locals() and isinstance(D_df, pd.DataFrame) and not D_df.empty: files.append(("decolagens_consecutivas.xlsx", df_to_excel_bytes(D_df.reset_index(drop=True))))
+if 'C_df' in locals() and isinstance(C_df, pd.DataFrame) and not C_df.empty: files.append(("operacoes_combinadas.xlsx", df_to_excel_bytes(C_df.reset_index(drop=True))))
+if 'pos_df' in locals() and isinstance(pos_df, pd.DataFrame) and not pos_df.empty: files.append(("dias_4_posicoes.xlsx", df_to_excel_bytes(pos_df.reset_index(drop=True))))
+if len(discarded_df)>0: files.append(("descartados.xlsx", df_to_excel_bytes(discarded_df.rename(columns={'_discard_reason':'Motivo'}))))
+zip_bytes = make_zip(files)
+st.download_button(f"Baixar pacote ZIP", data=zip_bytes, file_name=f"auditoria_rima_{int(window_min)}min.zip")
